@@ -1,0 +1,7 @@
+Input/
+Output/
+*.npy
+__pycache__/
+*.py[cod]
+.venv/
+venv/
