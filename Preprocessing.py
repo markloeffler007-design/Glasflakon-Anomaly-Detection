@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -382,7 +381,59 @@ def load_sequence(
 # 7. TRAINING-/TESTSPLIT UND FOLDS
 # ============================================================
 
-def assign_splits(df, test_fraction, n_folds, seed):
+def assign_splits_defects_in_test(df, test_fraction, n_folds, seed):
+    """
+    Split-Modus "defects_in_test" (für unüberwachte Modelle mit wenigen Fehlern):
+
+    - ALLE fehlerhaften Gruppen kommen ins Testset.
+    - Von den guten Gruppen kommen test_fraction (mindestens 1) ins Testset.
+    - Die übrigen guten Gruppen bilden trainval und werden auf die Folds verteilt.
+    - trainval enthält damit nur gute Gruppen.
+    Die Aufteilung erfolgt nach group_id (Hin- und Rückfahrt bleiben zusammen).
+    """
+    label_counts = df.groupby("group_id")["label"].nunique()
+    if (label_counts > 1).any():
+        raise ValueError("Mindestens eine group_id besitzt mehrere Labels.")
+
+    groups = (
+        df[["group_id", "label"]]
+        .drop_duplicates("group_id")
+        .reset_index(drop=True)
+    )
+    good_ids = groups.loc[groups["label"] == 0, "group_id"].to_numpy().copy()
+    bad_ids = groups.loc[groups["label"] != 0, "group_id"].to_numpy().copy()
+
+    n_good_test = int(round(test_fraction * len(good_ids))) if test_fraction > 0 else 0
+    if test_fraction > 0:
+        n_good_test = max(1, n_good_test)
+    n_good_train = len(good_ids) - n_good_test
+    if n_good_train < n_folds:
+        raise ValueError(
+            f"{len(good_ids)} gute Gruppen: nach {n_good_test} Test-Gruppen bleiben "
+            f"{n_good_train}, aber {n_folds} Folds verlangt. "
+            "Reduziere --folds oder --test-fraction."
+        )
+
+    rng = np.random.default_rng(seed)
+    rng.shuffle(good_ids)
+    test_good = set(good_ids[:n_good_test])
+    train_good = good_ids[n_good_test:]
+
+    df["split"] = "trainval"
+    df["fold"] = -1
+    df.loc[df["group_id"].isin(test_good | set(bad_ids)), "split"] = "test"
+
+    for j, group_id in enumerate(train_good):
+        df.loc[df["group_id"] == group_id, "fold"] = j % n_folds
+
+    print(
+        f"Split (defects_in_test): gute Gruppen Train/Val={len(train_good)}, "
+        f"gute Gruppen Test={len(test_good)}, fehlerhafte Gruppen Test={len(bad_ids)}"
+    )
+    return df
+
+
+def assign_splits(df, test_fraction, n_folds, seed, split_mode="stratified"):
     """
     Erstellt einen festen Testsplit.
 
@@ -394,6 +445,11 @@ def assign_splits(df, test_fraction, n_folds, seed):
     Die Folds werden innerhalb des trainval-Anteils
     annähernd klassenweise verteilt.
     """
+
+    if split_mode == "defects_in_test":
+        return assign_splits_defects_in_test(df, test_fraction, n_folds, seed)
+    if split_mode != "stratified":
+        raise ValueError(f"Unbekannter split_mode: {split_mode}")
 
     # --------------------------------------------------------
     # Prüfen, ob jede Gruppe nur ein Label besitzt
@@ -575,6 +631,17 @@ def main():
         "--test-fraction",
         type=float,
         default=DEFAULT_TEST_FRACTION
+    )
+
+    parser.add_argument(
+        "--split-mode",
+        choices=["stratified", "defects_in_test"],
+        default="stratified",
+        help=(
+            "stratified: Test- und Fold-Split über alle Gruppen (bisheriges Verhalten). "
+            "defects_in_test: alle fehlerhaften Gruppen ins Testset, --test-fraction "
+            "gilt nur für die guten Gruppen; trainval/Folds enthalten nur gute Gruppen."
+        )
     )
 
     parser.add_argument(
@@ -802,7 +869,8 @@ def main():
         df,
         args.test_fraction,
         args.folds,
-        args.seed
+        args.seed,
+        split_mode=args.split_mode
     )
 
     # --------------------------------------------------------
@@ -909,6 +977,8 @@ def main():
         "out_size_width_height": list(args.out_size),
 
         "test_fraction": args.test_fraction,
+
+        "split_mode": args.split_mode,
 
         "folds": args.folds,
 
