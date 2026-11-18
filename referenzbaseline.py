@@ -39,7 +39,7 @@ import numpy as np
 import pandas as pd
 import torch
 from PIL import Image
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, sobel
 from scipy.spatial import cKDTree
 from sklearn.metrics import average_precision_score, roc_auc_score
 from torch.utils.data import Dataset
@@ -166,10 +166,13 @@ class FrameDataset(Dataset):
 
     def __getitem__(self, k):
         part, local_i, t = self.items[k]
-        s = self.parts[part][local_i]
+        base = self.parts[part]
+        row_i, _ = base.items[local_i]
+        s = base[local_i]
         gray = (s["x"][0] * self.std + self.mean).clamp(0.0, 1.0)  # (H, W)
         return {
             "gray": gray,
+            "n_frames": int(base.df.iloc[row_i]["n_frames"]),
             "label": int(s["label"]),
             "bottle_id": str(s["bottle_id"]),
             "group_id": str(s.get("group_id", s["bottle_id"])),
@@ -579,14 +582,60 @@ def frame_score(amap, pixel_percent):
     return float(np.partition(flat, flat.size - n)[-n:].mean())
 
 
+def coarse_edges(image):
+    """Grobe Kantenkarte: Flächenmittelung vor der Gradientenberechnung."""
+    h, w = image.shape
+    step = max(1, min(h, w) // 32)
+    h, w = h // step, w // step
+    small = image[:h * step, :w * step].reshape(h, step, w, step).mean(axis=(1, 3))
+    return np.hypot(sobel(small, axis=0, mode="nearest"),
+                    sobel(small, axis=1, mode="nearest"))
+
+
+def temporal_offsets(model, frames, radius, window):
+    """Ein gemeinsames Delta je Fahrt und Abschnitt, in Originalframe-Einheiten."""
+    reference = {d: np.stack([coarse_edges(mu) for mu in means])
+                 for d, (means, _) in model.templates.items()}
+    # Bei gleichem Fehler gewinnt der kleinste Betrag, zuerst der Nullversatz.
+    candidates = sorted(range(-radius, radius + 1), key=abs)
+    costs = {}
+    blocks = []
+    for i in range(len(frames)):
+        sample = frames[i]
+        t, length = sample["frame_index"], sample["n_frames"]
+        key = (sample["bottle_id"], t // window)
+        blocks.append(key)
+        if key not in costs:
+            costs[key] = np.zeros(len(candidates))
+        edges = coarse_edges(sample["gray"].numpy())
+        refs = reference[sample["direction"]]
+        errors = {}
+        for j, delta in enumerate(candidates):
+            if not 0 <= t + delta < length:
+                costs[key][j] = np.inf
+                continue
+            phase = sample["phase"] if delta == 0 else (t + delta) / length
+            b = model.bin_of(phase)
+            if b not in errors:
+                errors[b] = np.abs(edges - refs[b]).mean()
+            costs[key][j] += errors[b]
+    winners = {key: candidates[np.argmin(values)] for key, values in costs.items()}
+    return [winners[key] for key in blocks]
+
+
 def score_frames(model, frames, cfg, heatmap_dir=None, heatmap_vmax=None, label=""):
     rows = []
     total = len(frames)
     start = time.perf_counter()
+    offsets = (temporal_offsets(model, frames, cfg["phase_shift"], cfg["phase_window"])
+               if cfg.get("phase_shift", 0) else None)
     for k in range(total):
         t0 = time.perf_counter()
         sample = frames[k]
-        amap = model.anomaly_map(sample["gray"], sample["direction"], sample["phase"])
+        delta = offsets[k] if offsets is not None else 0
+        ref_phase = ((sample["frame_index"] + delta) / sample["n_frames"]
+                     if delta else sample["phase"])
+        amap = model.anomaly_map(sample["gray"], sample["direction"], ref_phase)
         if cfg["sigma"] > 0:
             amap = gaussian_filter(amap, sigma=cfg["sigma"])
         score = frame_score(amap, cfg["pixel_percent"])
@@ -600,6 +649,9 @@ def score_frames(model, frames, cfg, heatmap_dir=None, heatmap_vmax=None, label=
             "score": score,
             "inference_time": time.perf_counter() - t0,
         })
+        if offsets is not None:
+            rows[-1].update(phase_shift_frames=delta, reference_phase=ref_phase,
+                            reference_bin=model.bin_of(ref_phase))
         if heatmap_dir is not None and heatmap_vmax is not None:
             safe = sample["bottle_id"].replace("/", "_").replace("\\", "_")
             save_heatmap(
@@ -623,6 +675,8 @@ def make_cfg(args, frame_hw, train_folds, train_groups, val_groups, train_time, 
         "bins": args.bins,
         "std_floor": args.std_floor,
         "shift_tol": args.shift_tol,
+        "phase_shift": args.phase_shift,
+        "phase_window": args.phase_window,
         "sigma": args.sigma,
         "pixel_percent": args.pixel_percent,
         "topk": args.topk,
@@ -654,6 +708,8 @@ def train_model(inputs_dir, store_dir, train_folds, model_name, args):
     print(f"Train-Folds: {train_folds}")
     print(f"Gute Gruppen: {len(good_groups)} -> Templates {len(train_groups)}, "
           f"Validierung {len(val_groups)}")
+    if args.phase_shift < 0 or args.phase_window < 1:
+        raise SystemExit("--phase-shift muss >= 0 und --phase-window >= 1 sein.")
     if args.knn_k < 0:
         raise SystemExit("--knn-k muss mindestens 0 sein.")
     if args.knn_k and len(val_groups) < 2:
@@ -890,6 +946,10 @@ def create_parser():
         p.add_argument("--bins", type=int, default=50, help="Phasen-Bins je Richtung für die Templates")
         p.add_argument("--std-floor", type=float, default=0.02,
                        help="Untergrenze der Pixel-Std (Intensität 0..1)")
+        p.add_argument("--phase-shift", type=int, default=0,
+                       help="Maximaler zeitlicher Vor-/Rückversatz in Frames (0 = aus)")
+        p.add_argument("--phase-window", type=int, default=9,
+                       help="Länge eines Abschnitts mit gemeinsamem Versatz in Originalframes")
         p.add_argument("--shift-tol", type=int, default=2,
                        help="Verschiebungstoleranz in Pixeln (0 = aus)")
         p.add_argument("--frame-stride", type=int, default=1, help="Nur Templates: jeder n-te Frame")
