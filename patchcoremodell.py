@@ -211,6 +211,58 @@ def import_faiss():
     return faiss
 
 
+def coreset_ratio(value):
+    ratio = float(value)
+    if not 0 < ratio <= 1:
+        raise argparse.ArgumentTypeError("Der Coreset-Anteil muss in (0, 1] liegen.")
+    return ratio
+
+
+def representative_indices(features, ratio):
+    """Blockweises k-Center-Greedy. Liefert Indizes in der Originalbank."""
+    n, dim = features.shape
+    target = max(1, int(np.ceil(n * ratio)))
+    if target == n:
+        return np.arange(n)
+
+    # Fester Seed für reproduzierbare Projektion und gemischte Blöcke.
+    rng = np.random.default_rng(42)
+    order = rng.permutation(n)
+    projection = None
+    if dim > 32:
+        projection = rng.standard_normal((dim, 32), dtype=np.float32) / np.sqrt(np.float32(32))
+
+    # Den Zielanteil über die
+    # kumulierte Blockgröße verteilen, damit die Gesamtzahl exakt stimmt.
+    block_size = max(1024, (n + target - 1) // target)
+    chosen = np.empty(target, dtype=np.intp)
+    used = 0
+    for start in range(0, n, block_size):
+        end = min(start + block_size, n)
+        limit = end * target // n
+        indices = order[start:end]
+        if limit == used:
+            continue
+        width = dim if projection is None else projection.shape[1]
+        points = np.empty((len(indices), width), dtype=np.float32)
+        for pos in range(0, len(indices), 1024):
+            rows = features[indices[pos:pos + 1024]].astype(np.float32, copy=False)
+            points[pos:pos + len(rows)] = rows if projection is None else rows @ projection
+
+        offset = points - points.mean(axis=0)
+        current = int(np.argmin(np.einsum("ij,ij->i", offset, offset)))
+        nearest = np.full(len(points), np.inf, dtype=np.float32)
+        while used < limit:
+            chosen[used] = indices[current]
+            used += 1
+            if used < limit:
+                offset = points - points[current]
+                np.minimum(nearest, np.einsum("ij,ij->i", offset, offset), out=nearest)
+                nearest[current] = -np.inf
+                current = int(nearest.argmax())
+    return chosen
+
+
 def build_faiss_index(bank, faiss, add_chunk=65536):
     """
     Erstellt einen exakten FAISS-Index.
@@ -983,6 +1035,12 @@ def cmd_score(args):
 
         t0 = time.perf_counter()
 
+        if args.coreset_ratio < 1:
+            original_count = len(bank)
+            selected = representative_indices(bank.numpy(), args.coreset_ratio)
+            bank = bank[torch.from_numpy(selected)]
+            print(f"Coreset: {len(bank):,} von {original_count:,} Trainingspatches")
+
         faiss_index = build_faiss_index(
             bank,
             faiss,
@@ -1464,6 +1522,7 @@ def cmd_cv(args):
             eval_split="trainval",
             eval_folds=[eval_fold],
 
+            coreset_ratio=args.coreset_ratio,
             phase_centers=args.phase_centers,
             phase_halfwidth=args.phase_halfwidth,
 
@@ -1763,6 +1822,12 @@ def main():
         "cv",
         help="Automatische K-Fold-Cross-Validation"
     )
+
+    for command in (score, cv):
+        command.add_argument(
+            "--coreset-ratio", type=coreset_ratio, default=1.0,
+            help="Anteil der Trainingspatches je Phasenfenster (1 = alle, 0.1 = 10 %%).",
+        )
 
     cv.add_argument(
         "--inputs",
