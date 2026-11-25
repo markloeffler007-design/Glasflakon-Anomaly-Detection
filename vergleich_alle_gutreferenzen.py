@@ -1,3 +1,35 @@
+"""Vergleich guter Flakons. Aufrufbeispiele über --help."""
+import argparse
+from itertools import combinations
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+
+def score_profiles(source, out):
+    data = pd.read_csv(source)
+    good = data.loc[data["label"] == 0].copy()
+    if good.empty:
+        raise ValueError("Keine guten Frames in der CSV.")
+    for direction, part in good.groupby("direction"):
+        fig, ax = plt.subplots(figsize=(11, 5))
+        for (_, bottle), frames in part.groupby(["group_id", "bottle_id"]):
+            frames = frames.sort_values("phase")
+            ax.plot(frames.phase, frames.score, label=bottle, linewidth=1)
+        ax.set(xlabel="Fahrphase", ylabel="Rohscore", title=str(direction))
+        ax.legend(fontsize=7, bbox_to_anchor=(1.01, 1), loc="upper left")
+        fig.tight_layout()
+        fig.savefig(out / f"rohscore_{direction}.png", dpi=150)
+        plt.close(fig)
+    peaks = good.loc[good.groupby(["group_id", "direction"]).score.idxmax()]
+    peaks.to_csv(out / "rohscore_maxima.csv", index=False)
+
+
+def compare_images(inputs, out, count, top_fraction):
     index = pd.read_csv(inputs / "index.csv")
     if not index.label.isin([0, 1]).all() or index.groupby("group_id").label.nunique().max() != 1:
         raise ValueError("Eindeutige Labels 0/1 je Gruppe erforderlich.")
