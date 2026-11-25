@@ -1,11 +1,14 @@
 """Vergleich guter Flakons. Aufrufbeispiele über --help."""
 import argparse
+import re
 from itertools import combinations
 from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.colors import PowerNorm
+from PIL import Image
 import numpy as np
 import pandas as pd
 
@@ -27,6 +30,81 @@ def score_profiles(source, out):
         plt.close(fig)
     peaks = good.loc[good.groupby(["group_id", "direction"]).score.idxmax()]
     peaks.to_csv(out / "rohscore_maxima.csv", index=False)
+
+
+def save_region_maps(inputs, out, index, ids, good_ids, top_frames):
+    """Pixelweise Absolutdifferenzen genau der in der Top-10-CSV gelisteten Frames."""
+    detail_dir = out / "top10_regionen"
+    detail_dir.mkdir(exist_ok=True)
+    paths = index.set_index(["group_id", "direction"])["path"]
+    row_index = {g: i for i, g in enumerate(ids)}
+    col_index = {g: i for i, g in enumerate(good_ids)}
+    colors = plt.get_cmap("inferno").copy()
+    colors.set_bad("#dddddd")
+    norm = PowerNorm(gamma=0.5, vmin=0, vmax=255)
+    overview = None
+
+    for number, ((a, b), pair) in enumerate(top_frames.groupby(["a", "b"], sort=False), 1):
+        cols = min(5, len(pair))
+        blocks = (len(pair) + cols - 1) // cols
+        fig, axes = plt.subplots(2 * blocks, cols, squeeze=False,
+                                 figsize=(3.1 * cols + 1, blocks * 4.8 + 0.8),
+                                 constrained_layout=True)
+        for ax in axes.flat:
+            ax.set_axis_off()
+        fig.suptitle(f"A: {a}     B: {b}\nJe Rang oben: Frame A   ·   unten: |A − B|")
+        tile_sum = None
+        try:
+            for direction, part in pair.groupby("direction"):
+                x, y = (np.load(inputs / str(paths.at[g, direction]).replace(chr(92), "/"),
+                                mmap_mode="r") for g in (a, b))
+                for r in part.itertuples(index=False):
+                    frame = x[r.frame_a]
+                    delta = np.abs(frame.astype(np.int16) - y[r.frame_b])
+                    # Übersicht in relativen Bildkoordinaten, auch bei wechselnder Bildgröße.
+                    if overview is None:
+                        h, w = delta.shape
+                        scale = min(1.0, 80 / max(h, w))
+                        tile_h, tile_w = max(1, round(h * scale)), max(1, round(w * scale))
+                        overview = np.full((len(ids), tile_h + 1, len(good_ids), tile_w + 1),
+                                           np.nan, dtype=np.float32)
+                    tile = Image.fromarray(delta.astype(np.float32)).resize(
+                        (tile_w, tile_h), Image.Resampling.BOX)
+                    if tile_sum is None:
+                        tile_sum = np.zeros((tile_h, tile_w), dtype=np.float32)
+                    tile_sum += np.asarray(tile)
+                    block, col = divmod(r.rang - 1, cols)
+                    upper, lower = axes[2 * block:2 * block + 2, col]
+                    upper.imshow(frame, cmap="gray", vmin=0, vmax=255, interpolation="nearest")
+                    upper.set_title(f"Rang {r.rang} · {direction}\nA {r.frame_a} / B {r.frame_b} · MAE {r.mae:.2f}",
+                                    fontsize=9)
+                    im = lower.imshow(delta, cmap=colors, norm=norm, interpolation="nearest")
+            fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.65, ticks=[0, 10, 40, 100, 180, 255],
+                         label="Absolute Grauwertdifferenz")
+            names = [re.sub(r"[^A-Za-z0-9_.-]", "_", str(g))[:55] for g in (a, b)]
+            fig.savefig(detail_dir / f"{number:04d}_{names[0]}_{names[1]}.png", dpi=100)
+        finally:
+            plt.close(fig)
+
+        tile = tile_sum / len(pair)
+        overview[row_index[a], :-1, col_index[b], :-1] = tile
+        if a in col_index:
+            overview[row_index[b], :-1, col_index[a], :-1] = tile
+
+    nrows, height, ncols, width = overview.shape
+    fig, ax = plt.subplots(figsize=(max(7, ncols * 0.75 + 3), max(5, nrows * 0.65 + 3)),
+                           constrained_layout=True)
+    try:
+        im = ax.imshow(overview.reshape(nrows * height, ncols * width), cmap=colors, norm=norm,
+                       interpolation="nearest")
+        ax.set_xticks(np.arange(ncols) * width + (width - 1) / 2, good_ids, rotation=90, fontsize=7)
+        ax.set_yticks(np.arange(nrows) * height + (height - 1) / 2, ids, fontsize=7)
+        ax.set_title("Mittlere absolute Pixeldifferenz der Top-Frames je Flakonpaar")
+        fig.colorbar(im, ax=ax, shrink=0.65, ticks=[0, 10, 40, 100, 180, 255],
+                     label="Mittlere absolute Grauwertdifferenz")
+        fig.savefig(out / "matrix_top10_regionen.png", dpi=140)
+    finally:
+        plt.close(fig)
 
 
 def compare_images(inputs, out, count, top_fraction):
@@ -87,6 +165,8 @@ def compare_images(inputs, out, count, top_fraction):
     )
     top_frames.insert(2, "rang", top_frames.groupby(["a", "b"], sort=False).cumcount() + 1)
     top_frames.to_csv(out / "paarvergleich_top10_frames.csv", index=False)
+
+    save_region_maps(inputs, out, index, ids, good_ids, top_frames)
 
     summary = []
     for (a, b, direction), part in detail.groupby(["a", "b", "direction"]):
